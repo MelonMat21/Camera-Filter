@@ -31,6 +31,7 @@ from mediapipe.tasks.python import vision
 
 # ----------------------------- CONFIG ---------------------------------------
 CAMERA_INDEX = 0          # 0 = default webcam. Try 1, 2 if you have several.
+CAMERA_W, CAMERA_H = 1280, 720   # higher res = more accurate hand tracking
 START_COLS = 120          # how many characters wide the ASCII image is
 CELL_W, CELL_H = 9, 16    # pixel size of one character cell (terminal-like 9x16)
 CANDIDATE_CHARS = " .'`^\",:;Il!i><~+_-?][}{1)(|/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$"
@@ -116,7 +117,11 @@ THUMB_TIP, INDEX_TIP = 4, 8      # MediaPipe landmark ids
 WRIST, MIDDLE_BASE = 0, 9        # used to measure hand size
 PINCH_ON, PINCH_OFF = 0.25, 0.35 # pinch distance / hand size (two thresholds
                                  # so it doesn't flicker at the edge)
-SMOOTH = 0.5                     # 0..1, higher = shape follows fingers faster
+# Smoothing (One Euro filter): steady when still, no lag when moving fast
+SMOOTH_MIN_CUTOFF = 1.0          # lower = less jitter when hands are still
+SMOOTH_BETA = 0.02               # higher = less lag when hands move fast
+SHAPE_SCALE = 1.4                # grow the shape out from its center (1.0 = exactly at fingertips)
+DETECT_CONFIDENCE = 0.7          # 0..1, higher = fewer false/wobbly detections
 LOST_GRACE = 0.6                 # seconds a hand can vanish before the shape resets
 
 
@@ -132,6 +137,9 @@ def make_hand_detector():
         base_options=mp_python.BaseOptions(model_asset_path=model),
         running_mode=vision.RunningMode.VIDEO,
         num_hands=2,
+        min_hand_detection_confidence=DETECT_CONFIDENCE,
+        min_hand_presence_confidence=DETECT_CONFIDENCE,
+        min_tracking_confidence=DETECT_CONFIDENCE,
     )
     return vision.HandLandmarker.create_from_options(options)
 
@@ -144,10 +152,48 @@ def pinch_ratio(hand):
     return dist(THUMB_TIP, INDEX_TIP) / max(dist(WRIST, MIDDLE_BASE), 1e-6)
 
 
+class OneEuroFilter:
+    """Adaptive smoothing: heavy smoothing when the points barely move
+    (kills jitter), light smoothing when they move fast (kills lag)."""
+
+    def __init__(self, min_cutoff=SMOOTH_MIN_CUTOFF, beta=SMOOTH_BETA, d_cutoff=1.0):
+        self.min_cutoff, self.beta, self.d_cutoff = min_cutoff, beta, d_cutoff
+        self.x = self.dx = self.t = None
+
+    @staticmethod
+    def _alpha(cutoff, dt):
+        tau = 1.0 / (2 * np.pi * cutoff)
+        return 1.0 / (1.0 + tau / dt)
+
+    def __call__(self, x, t):
+        if self.x is None:
+            self.x, self.dx, self.t = x, np.zeros_like(x), t
+            return x
+        dt = max(t - self.t, 1e-6)
+        a_d = self._alpha(self.d_cutoff, dt)
+        self.dx = self.dx + a_d * ((x - self.x) / dt - self.dx)
+        speed = np.abs(self.dx)              # per-coordinate speed (pixels/sec)
+        a = self._alpha(self.min_cutoff + self.beta * speed, dt)
+        self.x = self.x + a * (x - self.x)
+        self.t = t
+        return self.x
+
+
+def sort_hands(hands):
+    """Left-most hand first, so each hand keeps the same slot every frame."""
+    return sorted(hands, key=lambda hand: hand[WRIST].x)
+
+
+def expand_shape(corners, scale=SHAPE_SCALE):
+    """Push every corner away from the shape's center to make it bigger."""
+    center = corners.mean(axis=0)
+    return center + (corners - center) * scale
+
+
 def fingertips(hands, w, h):
     """The 4 corners of the shape, in pixels, going around the outside:
     left index -> right index -> right thumb -> left thumb."""
-    left, right = sorted(hands, key=lambda hand: hand[WRIST].x)
+    left, right = sort_hands(hands)
     def px(hand, i):
         return (hand[i].x * w, hand[i].y * h)
     return np.array([px(left, INDEX_TIP), px(right, INDEX_TIP),
@@ -186,7 +232,7 @@ def filter_in_shape(frame, ascii_img, corners):
     filtered = apply_filter(frame)
 
     # convexHull keeps the shape from twisting into a bow-tie if fingers cross
-    hull = cv2.convexHull(corners.astype(np.int32))
+    hull = cv2.convexHull(expand_shape(corners).astype(np.int32))
     mask = np.zeros((h, w), np.uint8)
     cv2.fillConvexPoly(mask, hull, 255, cv2.LINE_AA)
 
@@ -203,6 +249,10 @@ def main():
     if not cap.isOpened():
         raise SystemExit(f"Could not open camera {CAMERA_INDEX}. "
                          "Check permissions or try another CAMERA_INDEX.")
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_H)
+    print("Camera resolution:", int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+          "x", int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
 
     atlas = build_glyph_atlas(CANDIDATE_CHARS, CELL_W, CELL_H)
     print(f"Using {len(atlas)} distinct brightness levels.")
@@ -214,6 +264,7 @@ def main():
     pinch_state = [False, False]     # per detected hand, for hysteresis
     landed = False                   # True after the double-pinch "landing"
     corners = None                   # smoothed fingertip positions
+    smoother = OneEuroFilter()
     last_seen = 0.0                  # last time both hands were visible
 
     while True:
@@ -229,7 +280,7 @@ def main():
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         result = detector.detect_for_video(mp_image, int((time.time() - start) * 1000))
-        hands = result.hand_landmarks
+        hands = sort_hands(result.hand_landmarks)
 
         pinched = []
         for i, hand in enumerate(hands):
@@ -244,11 +295,11 @@ def main():
             # Landing: touch thumb + index on BOTH hands to start the shape
             if all(pinched):
                 landed = True
-            target = fingertips(hands, w, h)
-            corners = target if corners is None else corners + SMOOTH * (target - corners)
+            corners = smoother(fingertips(hands, w, h), now)
         elif now - last_seen > LOST_GRACE:
             # a hand left the camera for too long -> back to waiting
             landed, corners = False, None
+            smoother = OneEuroFilter()
 
         ascii_img = full_ascii(frame, cols, atlas, invert, grey)   # landing screen
         if landed and corners is not None:
