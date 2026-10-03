@@ -1,34 +1,53 @@
 """
-ascii_cam.py - Real-time webcam as grey terminal ASCII, with a finger-shape window
+Filter.py - Real-time webcam as grey terminal ASCII, with a finger-shape window
+that shows the filter you pick from the navbar.
 
 Install:   pip install opencv-contrib-python numpy mediapipe
-Run:       python ascii_cam.py
+Run:       python Filter.py
 
 How to use:
-    1. Landing: touch thumb + index finger together on BOTH hands.
+    1. Landing: the whole screen is grey ASCII.
+       Touch thumb + index finger together on BOTH hands.
     2. Pull your fingers apart - the 4 fingertips make a shape.
        Everything is ASCII; inside the shape you see the filter.
        The shape follows your fingers. Drop a hand out of view to reset.
-    3. Tap (pinch both hands) again to switch filter: camera -> blocks -> camera ...
+    3. Pick a filter by clicking the navbar at the top:
+         Photo    : Film, Dreamy Glow, Moody B&W
+         Cartoons : Cartoon, Pencil Sketch, Comic Book
+         Memes    : Meme Pose Detector (normal camera + a banner naming the meme)
+         Animated : Matrix Rain, Snowfall, Glitch, Finger Sparkles
+       Or tap (pinch both hands) again to go to the next filter in the category.
 
-Needs hand_landmarker.task (MediaPipe hand model) in the same folder.
+Files:
+    Filter.py      this file: camera, hand tracking, ASCII, navbar
+    common.py      shared colors, font, model downloader
+    filters/       one file per filter (+ base.py helpers, __init__.py = navbar list)
+
+Needs hand_landmarker.task and pose_landmarker_lite.task (MediaPipe models)
+in the same folder. They are downloaded automatically if missing.
 
 Controls:
+    mouse    : click a category / filter in the navbar
+    1 - 4    : switch category (Photo, Cartoons, Memes, Animated)
+    f        : next filter in the category (same as the pinch tap)
     q or ESC : quit
-    + / -    : more / fewer characters (more = more detail, slower)
-    c        : toggle grey <-> bright white
-    i        : invert brightness (dense characters for dark areas)
-    f        : switch filter (same as the pinch tap)
+    + / -    : more / fewer ASCII characters (more = more detail, slower)
+    c        : toggle grey <-> bright white ASCII
+    i        : invert ASCII brightness
     s        : save a screenshot (ascii_<timestamp>.png)
 """
 
-import os
 import time
+from types import SimpleNamespace
+
 import cv2
 import numpy as np
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
+
+from common import FONT, GREY, model_path
+from filters import CATEGORIES      # every filter lives in its own file in filters/
 
 # ----------------------------- CONFIG ---------------------------------------
 CAMERA_INDEX = 0          # 0 = default webcam. Try 1, 2 if you have several.
@@ -36,9 +55,9 @@ CAMERA_W, CAMERA_H = 1280, 720   # higher res = more accurate hand tracking
 START_COLS = 120          # how many characters wide the ASCII image is
 CELL_W, CELL_H = 9, 16    # pixel size of one character cell (terminal-like 9x16)
 CANDIDATE_CHARS = " .'`^\",:;Il!i><~+_-?][}{1)(|/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$"
-GREY = (192, 192, 192)    # BGR text color (classic terminal grey)
-BLOCK_SIZE = 24           # pixel size of each square in the "blocks" filter
 TAP_COOLDOWN = 0.5        # seconds between filter switches (stops double triggers)
+WINDOW = "ASCII Cam"
+
 # ----------------------------------------------------------------------------
 
 
@@ -109,10 +128,15 @@ def colorize(mono, grey=True):
     """Turn the 1-channel glyph image into a BGR image (grey or white)."""
     if not grey:
         return cv2.merge([mono, mono, mono])
-    b = (mono * (GREY[0] / 255)).astype(np.uint8)
-    g = (mono * (GREY[1] / 255)).astype(np.uint8)
-    r = (mono * (GREY[2] / 255)).astype(np.uint8)
-    return cv2.merge([b, g, r])
+    return cv2.merge([cv2.LUT(mono, (np.arange(256) * (c / 255)).astype(np.uint8)) for c in GREY])
+
+
+def full_ascii(frame, cols, atlas, invert, grey):
+    """The whole frame as ASCII, resized back to the camera's size."""
+    h, w = frame.shape[:2]
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    ascii_img = colorize(frame_to_ascii(gray, cols, atlas, invert), grey)
+    return cv2.resize(ascii_img, (w, h), interpolation=cv2.INTER_AREA)
 
 
 # ----------------------------- HAND TRACKING --------------------------------
@@ -120,24 +144,18 @@ THUMB_TIP, INDEX_TIP = 4, 8      # MediaPipe landmark ids
 WRIST, MIDDLE_BASE = 0, 9        # used to measure hand size
 PINCH_ON, PINCH_OFF = 0.25, 0.35 # pinch distance / hand size (two thresholds
                                  # so it doesn't flicker at the edge)
+LOST_GRACE = 0.6                 # seconds a hand can vanish before the shape resets
 # Smoothing (One Euro filter): steady when still, no lag when moving fast
 SMOOTH_MIN_CUTOFF = 1.0          # lower = less jitter when hands are still
 SMOOTH_BETA = 0.02               # higher = less lag when hands move fast
 SHAPE_SCALE = 1.4                # grow the shape out from its center (1.0 = exactly at fingertips)
 DETECT_CONFIDENCE = 0.7          # 0..1, higher = fewer false/wobbly detections
-LOST_GRACE = 0.6                 # seconds a hand can vanish before the shape resets
 
 
 def make_hand_detector():
     """Load MediaPipe's hand model (hand_landmarker.task next to this file)."""
-    model = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         "hand_landmarker.task")
-    if not os.path.exists(model):
-        raise SystemExit("Missing hand_landmarker.task - download it from\n"
-                         "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
-                         "hand_landmarker/float16/latest/hand_landmarker.task")
     options = vision.HandLandmarkerOptions(
-        base_options=mp_python.BaseOptions(model_asset_path=model),
+        base_options=mp_python.BaseOptions(model_asset_path=model_path("hand_landmarker.task")),
         running_mode=vision.RunningMode.VIDEO,
         num_hands=2,
         min_hand_detection_confidence=DETECT_CONFIDENCE,
@@ -215,61 +233,83 @@ def draw_fingers(img, hands, pinched):
             cv2.circle(img, pt, 8, color, -1, cv2.LINE_AA)
 
 
-def full_ascii(frame, cols, atlas, invert, grey):
-    """The whole frame as ASCII, resized back to the camera's size."""
-    h, w = frame.shape[:2]
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    ascii_img = colorize(frame_to_ascii(gray, cols, atlas, invert), grey)
-    return cv2.resize(ascii_img, (w, h), interpolation=cv2.INTER_AREA)
-
-
-# ----------------------------- FILTERS --------------------------------------
-# Each filter takes the camera frame (BGR) and returns an image the same size.
-
-def camera_filter(frame):
-    """Filter 1: the normal camera."""
-    return frame
-
-
-def blocks_filter(frame, size=BLOCK_SIZE):
-    """Filter 2: big square color blocks with dark lines between them.
-    1. Shrink the frame so each block becomes 1 pixel (averages its color).
-    2. Blow each pixel back up into a size x size square.
-    3. Darken the edge row/column of every square to draw the grid."""
-    h, w = frame.shape[:2]
-    small_w, small_h = -(-w // size), -(-h // size)       # ceil division
-    small = cv2.resize(frame, (small_w, small_h), interpolation=cv2.INTER_AREA)
-    blocks = small.repeat(size, axis=0).repeat(size, axis=1)[:h, :w].copy()
-    blocks[::size, :] //= 2
-    blocks[:, ::size] //= 2
-    return blocks
-
-
-# (name, function) - add new filters to this list and the tap will cycle them
-FILTERS = [
-    ("camera", camera_filter),
-    ("blocks", blocks_filter),
-]
-
-
-def filter_in_shape(frame, ascii_img, corners, filter_index):
-    """ASCII everywhere, the chosen filter only inside the finger shape."""
-    h, w = frame.shape[:2]
-    filtered = FILTERS[filter_index][1](frame)
-
+def filter_in_shape(ascii_img, filtered, corners):
+    """ASCII everywhere, the filtered image only inside the finger shape."""
+    h, w = ascii_img.shape[:2]
     # convexHull keeps the shape from twisting into a bow-tie if fingers cross
     hull = cv2.convexHull(expand_shape(corners).astype(np.int32))
     mask = np.zeros((h, w), np.uint8)
     cv2.fillConvexPoly(mask, hull, 255, cv2.LINE_AA)
 
-    out = ascii_img.copy()
-    out[mask > 0] = filtered[mask > 0]
+    out = cv2.copyTo(filtered, mask, ascii_img.copy())     # filter only where mask is set
     cv2.polylines(out, [hull], True, GREY, 2, cv2.LINE_AA)
     for x, y in corners:
         cv2.circle(out, (int(x), int(y)), 6, (255, 255, 255), -1, cv2.LINE_AA)
     return out
 
 
+# ----------------------------- NAVBAR ---------------------------------------
+NAV_TAB_H, NAV_SUB_H = 40, 34          # category row, filter row (pixels)
+NAV_H = NAV_TAB_H + NAV_SUB_H
+
+
+def nav_buttons(w, cat):
+    """Every navbar button as (x0, y0, x1, y1, label, kind, index)."""
+    buttons = []
+    n = len(CATEGORIES)
+    for i, (name, _) in enumerate(CATEGORIES):
+        buttons.append((i * w // n, 0, (i + 1) * w // n, NAV_TAB_H, name.upper(), "cat", i))
+    filters = CATEGORIES[cat][1]
+    m = len(filters)
+    for j, f in enumerate(filters):
+        buttons.append((j * w // m, NAV_TAB_H, (j + 1) * w // m, NAV_H, f.name, "filter", j))
+    return buttons
+
+
+def draw_navbar(w, ui):
+    """Terminal-style bar: selected button = grey block with black text."""
+    bar = np.full((NAV_H, w, 3), 18, np.uint8)
+    hx, hy = ui["hover"]
+    for x0, y0, x1, y1, label, kind, i in nav_buttons(w, ui["cat"]):
+        selected = i == (ui["cat"] if kind == "cat" else ui["sel"][ui["cat"]])
+        hovered = x0 <= hx < x1 and y0 <= hy < y1
+        if selected:
+            cv2.rectangle(bar, (x0 + 2, y0 + 3), (x1 - 3, y1 - 4), GREY, -1)
+            color = (0, 0, 0)
+        elif hovered:
+            cv2.rectangle(bar, (x0 + 2, y0 + 3), (x1 - 3, y1 - 4), (55, 55, 55), -1)
+            color = (240, 240, 240)
+        else:
+            color = GREY
+        scale = 0.6 if kind == "cat" else 0.5
+        (tw, th), _ = cv2.getTextSize(label, FONT, scale, 1)
+        cv2.putText(bar, label, (x0 + (x1 - x0 - tw) // 2, y0 + (y1 - y0 + th) // 2),
+                    FONT, scale, color, 1, cv2.LINE_AA)
+    cv2.line(bar, (0, NAV_TAB_H), (w, NAV_TAB_H), (60, 60, 60), 1)
+    cv2.line(bar, (0, NAV_H - 1), (w, NAV_H - 1), (90, 90, 90), 1)
+    return bar
+
+
+def on_mouse(event, x, y, flags, ui):
+    """Mouse callback: hover highlight + click to pick a category / filter."""
+    ui["hover"] = (x, y)
+    if event != cv2.EVENT_LBUTTONDOWN or ui["width"] is None:
+        return
+    for x0, y0, x1, y1, _, kind, i in nav_buttons(ui["width"], ui["cat"]):
+        if x0 <= x < x1 and y0 <= y < y1:
+            if kind == "cat":
+                ui["cat"] = i
+            else:
+                ui["sel"][ui["cat"]] = i
+            return
+
+
+def next_filter(ui):
+    cat = ui["cat"]
+    ui["sel"][cat] = (ui["sel"][cat] + 1) % len(CATEGORIES[cat][1])
+
+
+# ----------------------------- MAIN -----------------------------------------
 def main():
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
@@ -284,15 +324,20 @@ def main():
     print(f"Using {len(atlas)} distinct brightness levels.")
     detector = make_hand_detector()
 
+    # navbar state (shared with the mouse callback)
+    ui = {"cat": 0, "sel": [0] * len(CATEGORIES), "hover": (-1, -1), "width": None}
+    cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(WINDOW, on_mouse, ui)
+
     cols, grey, invert = START_COLS, True, False
     prev, fps = time.time(), 0.0
     start = time.time()
+    last_ts = -1
     pinch_state = [False, False]     # per detected hand, for hysteresis
     landed = False                   # True after the double-pinch "landing"
     corners = None                   # smoothed fingertip positions
     smoother = OneEuroFilter()
     last_seen = 0.0                  # last time both hands were visible
-    filter_index = 0                 # which entry of FILTERS is in the shape
     was_tapping = False              # both hands pinched last frame?
     last_tap = 0.0
 
@@ -304,12 +349,17 @@ def main():
 
         frame = cv2.flip(frame, 1)                       # mirror, like a selfie
         h, w = frame.shape[:2]
+        if ui["width"] is None:                          # first frame: size the window
+            ui["width"] = w
+            cv2.resizeWindow(WINDOW, w, h + NAV_H)
 
-        # --- detect hands (MediaPipe wants RGB + increasing timestamps) ---
+        # --- detect hands (MediaPipe wants RGB + strictly increasing timestamps) ---
+        now = time.time()
+        ts = max(int((now - start) * 1000), last_ts + 1)
+        last_ts = ts
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        result = detector.detect_for_video(mp_image, int((time.time() - start) * 1000))
-        hands = sort_hands(result.hand_landmarks)
+        hands = sort_hands(detector.detect_for_video(mp_image, ts).hand_landmarks)
 
         pinched = []
         for i, hand in enumerate(hands):
@@ -318,7 +368,6 @@ def main():
             pinched.append(r < (PINCH_OFF if was else PINCH_ON))
         pinch_state = pinched + [False] * (2 - len(pinched))
 
-        now = time.time()
         if len(hands) == 2:
             last_seen = now
             # A "tap" = both hands pinch, counted once when the pinch starts
@@ -326,9 +375,9 @@ def main():
             if tapping and not was_tapping and now - last_tap > TAP_COOLDOWN:
                 last_tap = now
                 if not landed:
-                    landed = True                                    # landing
+                    landed = True                        # landing
                 else:
-                    filter_index = (filter_index + 1) % len(FILTERS) # next filter
+                    next_filter(ui)                      # next filter in category
             was_tapping = tapping
             corners = smoother(fingertips(hands, w, h), now)
         elif now - last_seen > LOST_GRACE:
@@ -336,23 +385,32 @@ def main():
             landed, corners, was_tapping = False, None, False
             smoother = OneEuroFilter()
 
+        current = CATEGORIES[ui["cat"]][1][ui["sel"][ui["cat"]]]
+        ctx = SimpleNamespace(t=now - start, dt=min(max(now - prev, 1e-3), 0.1),
+                              hands=hands, mp_image=mp_image, timestamp_ms=ts)
+
         ascii_img = full_ascii(frame, cols, atlas, invert, grey)   # landing screen
         if landed and corners is not None:
-            out = filter_in_shape(frame, ascii_img, corners, filter_index)
+            out = filter_in_shape(ascii_img, current.render(frame, ctx), corners)
         else:
             out = ascii_img
             draw_fingers(out, hands, pinched)
+        current.overlay(out, ctx)                        # banner / sparkles
 
         # FPS counter (smoothed)
         fps = 0.9 * fps + 0.1 * (1.0 / max(now - prev, 1e-6))
         prev = now
-        status = (f"filter: {FILTERS[filter_index][0]} (tap to switch)" if landed else f"pinch both hands to start | hands {len(hands)}/2")
-        cv2.putText(out, f"{fps:4.1f} fps | {status}", (8, 18),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, GREY, 1, cv2.LINE_AA)
+        status = ("tap to switch filter" if landed
+                  else f"pinch both hands to start | hands {len(hands)}/2")
+        cv2.putText(out, f"{fps:4.1f} fps | {CATEGORIES[ui['cat']][0]} > {current.name} | {status}",
+                    (8, 22), FONT, 0.5, GREY, 1, cv2.LINE_AA)
 
-        cv2.imshow("ASCII Cam", out)
+        screen = np.vstack([draw_navbar(w, ui), out])
+        cv2.imshow(WINDOW, screen)
 
         key = cv2.waitKey(1) & 0xFF
+        if cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) < 1:
+            break                                        # window closed with the X
         if key in (ord("q"), 27):
             break
         elif key in (ord("+"), ord("=")):
@@ -363,13 +421,18 @@ def main():
             grey = not grey
         elif key == ord("i"):
             invert = not invert
+        elif ord("1") <= key < ord("1") + len(CATEGORIES):
+            ui["cat"] = key - ord("1")
         elif key == ord("f"):
-            filter_index = (filter_index + 1) % len(FILTERS)
+            next_filter(ui)
         elif key == ord("s"):
             name = time.strftime("ascii_%Y%m%d_%H%M%S.png")
-            cv2.imwrite(name, out)
+            cv2.imwrite(name, screen)
             print("Saved", name)
 
+    for _, filters in CATEGORIES:
+        for f in filters:
+            f.close()
     detector.close()
     cap.release()
     cv2.destroyAllWindows()
