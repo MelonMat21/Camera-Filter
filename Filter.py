@@ -7,9 +7,9 @@ Run:       python ascii_cam.py
 How to use:
     1. Landing: touch thumb + index finger together on BOTH hands.
     2. Pull your fingers apart - the 4 fingertips make a shape.
-       Everything is ASCII; inside the shape you see the filter
-       (for now, the normal camera).
+       Everything is ASCII; inside the shape you see the filter.
        The shape follows your fingers. Drop a hand out of view to reset.
+    3. Tap (pinch both hands) again to switch filter: camera -> blocks -> camera ...
 
 Needs hand_landmarker.task (MediaPipe hand model) in the same folder.
 
@@ -18,6 +18,7 @@ Controls:
     + / -    : more / fewer characters (more = more detail, slower)
     c        : toggle grey <-> bright white
     i        : invert brightness (dense characters for dark areas)
+    f        : switch filter (same as the pinch tap)
     s        : save a screenshot (ascii_<timestamp>.png)
 """
 
@@ -36,6 +37,8 @@ START_COLS = 120          # how many characters wide the ASCII image is
 CELL_W, CELL_H = 9, 16    # pixel size of one character cell (terminal-like 9x16)
 CANDIDATE_CHARS = " .'`^\",:;Il!i><~+_-?][}{1)(|/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$"
 GREY = (192, 192, 192)    # BGR text color (classic terminal grey)
+BLOCK_SIZE = 24           # pixel size of each square in the "blocks" filter
+TAP_COOLDOWN = 0.5        # seconds between filter switches (stops double triggers)
 # ----------------------------------------------------------------------------
 
 
@@ -220,16 +223,39 @@ def full_ascii(frame, cols, atlas, invert, grey):
     return cv2.resize(ascii_img, (w, h), interpolation=cv2.INTER_AREA)
 
 
-def apply_filter(frame):
-    """The filter shown inside the finger shape. For now: the normal camera.
-    Swap this out later for other filters."""
+# ----------------------------- FILTERS --------------------------------------
+# Each filter takes the camera frame (BGR) and returns an image the same size.
+
+def camera_filter(frame):
+    """Filter 1: the normal camera."""
     return frame
 
 
-def filter_in_shape(frame, ascii_img, corners):
-    """ASCII everywhere, the filter only inside the finger shape."""
+def blocks_filter(frame, size=BLOCK_SIZE):
+    """Filter 2: big square color blocks with dark lines between them.
+    1. Shrink the frame so each block becomes 1 pixel (averages its color).
+    2. Blow each pixel back up into a size x size square.
+    3. Darken the edge row/column of every square to draw the grid."""
     h, w = frame.shape[:2]
-    filtered = apply_filter(frame)
+    small_w, small_h = -(-w // size), -(-h // size)       # ceil division
+    small = cv2.resize(frame, (small_w, small_h), interpolation=cv2.INTER_AREA)
+    blocks = small.repeat(size, axis=0).repeat(size, axis=1)[:h, :w].copy()
+    blocks[::size, :] //= 2
+    blocks[:, ::size] //= 2
+    return blocks
+
+
+# (name, function) - add new filters to this list and the tap will cycle them
+FILTERS = [
+    ("camera", camera_filter),
+    ("blocks", blocks_filter),
+]
+
+
+def filter_in_shape(frame, ascii_img, corners, filter_index):
+    """ASCII everywhere, the chosen filter only inside the finger shape."""
+    h, w = frame.shape[:2]
+    filtered = FILTERS[filter_index][1](frame)
 
     # convexHull keeps the shape from twisting into a bow-tie if fingers cross
     hull = cv2.convexHull(expand_shape(corners).astype(np.int32))
@@ -266,6 +292,9 @@ def main():
     corners = None                   # smoothed fingertip positions
     smoother = OneEuroFilter()
     last_seen = 0.0                  # last time both hands were visible
+    filter_index = 0                 # which entry of FILTERS is in the shape
+    was_tapping = False              # both hands pinched last frame?
+    last_tap = 0.0
 
     while True:
         ok, frame = cap.read()
@@ -292,18 +321,24 @@ def main():
         now = time.time()
         if len(hands) == 2:
             last_seen = now
-            # Landing: touch thumb + index on BOTH hands to start the shape
-            if all(pinched):
-                landed = True
+            # A "tap" = both hands pinch, counted once when the pinch starts
+            tapping = all(pinched)
+            if tapping and not was_tapping and now - last_tap > TAP_COOLDOWN:
+                last_tap = now
+                if not landed:
+                    landed = True                                    # landing
+                else:
+                    filter_index = (filter_index + 1) % len(FILTERS) # next filter
+            was_tapping = tapping
             corners = smoother(fingertips(hands, w, h), now)
         elif now - last_seen > LOST_GRACE:
             # a hand left the camera for too long -> back to waiting
-            landed, corners = False, None
+            landed, corners, was_tapping = False, None, False
             smoother = OneEuroFilter()
 
         ascii_img = full_ascii(frame, cols, atlas, invert, grey)   # landing screen
         if landed and corners is not None:
-            out = filter_in_shape(frame, ascii_img, corners)
+            out = filter_in_shape(frame, ascii_img, corners, filter_index)
         else:
             out = ascii_img
             draw_fingers(out, hands, pinched)
@@ -311,7 +346,7 @@ def main():
         # FPS counter (smoothed)
         fps = 0.9 * fps + 0.1 * (1.0 / max(now - prev, 1e-6))
         prev = now
-        status = "filter shape" if landed else f"pinch both hands to start | hands {len(hands)}/2"
+        status = (f"filter: {FILTERS[filter_index][0]} (tap to switch)" if landed else f"pinch both hands to start | hands {len(hands)}/2")
         cv2.putText(out, f"{fps:4.1f} fps | {status}", (8, 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, GREY, 1, cv2.LINE_AA)
 
@@ -328,6 +363,8 @@ def main():
             grey = not grey
         elif key == ord("i"):
             invert = not invert
+        elif key == ord("f"):
+            filter_index = (filter_index + 1) % len(FILTERS)
         elif key == ord("s"):
             name = time.strftime("ascii_%Y%m%d_%H%M%S.png")
             cv2.imwrite(name, out)
