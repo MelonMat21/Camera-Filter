@@ -1,8 +1,17 @@
 """
-ascii_cam.py - Real-time webcam -> ASCII filter (grey on black, like a terminal)
+ascii_cam.py - Real-time webcam as grey terminal ASCII, with a finger-shape window
 
-Install:   pip install opencv-python numpy
+Install:   pip install opencv-contrib-python numpy mediapipe
 Run:       python ascii_cam.py
+
+How to use:
+    1. Landing: touch thumb + index finger together on BOTH hands.
+    2. Pull your fingers apart - the 4 fingertips make a shape.
+       Everything is ASCII; inside the shape you see the filter
+       (for now, the normal camera).
+       The shape follows your fingers. Drop a hand out of view to reset.
+
+Needs hand_landmarker.task (MediaPipe hand model) in the same folder.
 
 Controls:
     q or ESC : quit
@@ -12,9 +21,13 @@ Controls:
     s        : save a screenshot (ascii_<timestamp>.png)
 """
 
+import os
 import time
 import cv2
 import numpy as np
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision
 
 # ----------------------------- CONFIG ---------------------------------------
 CAMERA_INDEX = 0          # 0 = default webcam. Try 1, 2 if you have several.
@@ -98,6 +111,93 @@ def colorize(mono, grey=True):
     return cv2.merge([b, g, r])
 
 
+# ----------------------------- HAND TRACKING --------------------------------
+THUMB_TIP, INDEX_TIP = 4, 8      # MediaPipe landmark ids
+WRIST, MIDDLE_BASE = 0, 9        # used to measure hand size
+PINCH_ON, PINCH_OFF = 0.25, 0.35 # pinch distance / hand size (two thresholds
+                                 # so it doesn't flicker at the edge)
+SMOOTH = 0.5                     # 0..1, higher = shape follows fingers faster
+LOST_GRACE = 0.6                 # seconds a hand can vanish before the shape resets
+
+
+def make_hand_detector():
+    """Load MediaPipe's hand model (hand_landmarker.task next to this file)."""
+    model = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "hand_landmarker.task")
+    if not os.path.exists(model):
+        raise SystemExit("Missing hand_landmarker.task - download it from\n"
+                         "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+                         "hand_landmarker/float16/latest/hand_landmarker.task")
+    options = vision.HandLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=model),
+        running_mode=vision.RunningMode.VIDEO,
+        num_hands=2,
+    )
+    return vision.HandLandmarker.create_from_options(options)
+
+
+def pinch_ratio(hand):
+    """Thumb-tip to index-tip distance, divided by the hand's size.
+    Dividing by hand size makes it work whether you're near or far."""
+    def dist(a, b):
+        return np.hypot(hand[a].x - hand[b].x, hand[a].y - hand[b].y)
+    return dist(THUMB_TIP, INDEX_TIP) / max(dist(WRIST, MIDDLE_BASE), 1e-6)
+
+
+def fingertips(hands, w, h):
+    """The 4 corners of the shape, in pixels, going around the outside:
+    left index -> right index -> right thumb -> left thumb."""
+    left, right = sorted(hands, key=lambda hand: hand[WRIST].x)
+    def px(hand, i):
+        return (hand[i].x * w, hand[i].y * h)
+    return np.array([px(left, INDEX_TIP), px(right, INDEX_TIP),
+                     px(right, THUMB_TIP), px(left, THUMB_TIP)], np.float32)
+
+
+def draw_fingers(img, hands, pinched):
+    """Dot on thumb + index tip of each hand, line between them.
+    Grey = apart, white = touching."""
+    h, w = img.shape[:2]
+    for hand, is_pinched in zip(hands, pinched):
+        color = (255, 255, 255) if is_pinched else GREY
+        pts = [(int(hand[i].x * w), int(hand[i].y * h)) for i in (THUMB_TIP, INDEX_TIP)]
+        cv2.line(img, pts[0], pts[1], color, 2, cv2.LINE_AA)
+        for pt in pts:
+            cv2.circle(img, pt, 8, color, -1, cv2.LINE_AA)
+
+
+def full_ascii(frame, cols, atlas, invert, grey):
+    """The whole frame as ASCII, resized back to the camera's size."""
+    h, w = frame.shape[:2]
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    ascii_img = colorize(frame_to_ascii(gray, cols, atlas, invert), grey)
+    return cv2.resize(ascii_img, (w, h), interpolation=cv2.INTER_AREA)
+
+
+def apply_filter(frame):
+    """The filter shown inside the finger shape. For now: the normal camera.
+    Swap this out later for other filters."""
+    return frame
+
+
+def filter_in_shape(frame, ascii_img, corners):
+    """ASCII everywhere, the filter only inside the finger shape."""
+    h, w = frame.shape[:2]
+    filtered = apply_filter(frame)
+
+    # convexHull keeps the shape from twisting into a bow-tie if fingers cross
+    hull = cv2.convexHull(corners.astype(np.int32))
+    mask = np.zeros((h, w), np.uint8)
+    cv2.fillConvexPoly(mask, hull, 255, cv2.LINE_AA)
+
+    out = ascii_img.copy()
+    out[mask > 0] = filtered[mask > 0]
+    cv2.polylines(out, [hull], True, GREY, 2, cv2.LINE_AA)
+    for x, y in corners:
+        cv2.circle(out, (int(x), int(y)), 6, (255, 255, 255), -1, cv2.LINE_AA)
+    return out
+
+
 def main():
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
@@ -106,9 +206,15 @@ def main():
 
     atlas = build_glyph_atlas(CANDIDATE_CHARS, CELL_W, CELL_H)
     print(f"Using {len(atlas)} distinct brightness levels.")
+    detector = make_hand_detector()
 
     cols, grey, invert = START_COLS, True, False
     prev, fps = time.time(), 0.0
+    start = time.time()
+    pinch_state = [False, False]     # per detected hand, for hysteresis
+    landed = False                   # True after the double-pinch "landing"
+    corners = None                   # smoothed fingertip positions
+    last_seen = 0.0                  # last time both hands were visible
 
     while True:
         ok, frame = cap.read()
@@ -117,16 +223,45 @@ def main():
             break
 
         frame = cv2.flip(frame, 1)                       # mirror, like a selfie
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h, w = frame.shape[:2]
 
-        mono = frame_to_ascii(gray, cols, atlas, invert)
-        out = colorize(mono, grey)
+        # --- detect hands (MediaPipe wants RGB + increasing timestamps) ---
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        result = detector.detect_for_video(mp_image, int((time.time() - start) * 1000))
+        hands = result.hand_landmarks
+
+        pinched = []
+        for i, hand in enumerate(hands):
+            r = pinch_ratio(hand)
+            was = pinch_state[i] if i < len(pinch_state) else False
+            pinched.append(r < (PINCH_OFF if was else PINCH_ON))
+        pinch_state = pinched + [False] * (2 - len(pinched))
+
+        now = time.time()
+        if len(hands) == 2:
+            last_seen = now
+            # Landing: touch thumb + index on BOTH hands to start the shape
+            if all(pinched):
+                landed = True
+            target = fingertips(hands, w, h)
+            corners = target if corners is None else corners + SMOOTH * (target - corners)
+        elif now - last_seen > LOST_GRACE:
+            # a hand left the camera for too long -> back to waiting
+            landed, corners = False, None
+
+        ascii_img = full_ascii(frame, cols, atlas, invert, grey)   # landing screen
+        if landed and corners is not None:
+            out = filter_in_shape(frame, ascii_img, corners)
+        else:
+            out = ascii_img
+            draw_fingers(out, hands, pinched)
 
         # FPS counter (smoothed)
-        now = time.time()
         fps = 0.9 * fps + 0.1 * (1.0 / max(now - prev, 1e-6))
         prev = now
-        cv2.putText(out, f"{fps:4.1f} fps | {cols} cols", (8, 18),
+        status = "filter shape" if landed else f"pinch both hands to start | hands {len(hands)}/2"
+        cv2.putText(out, f"{fps:4.1f} fps | {status}", (8, 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, GREY, 1, cv2.LINE_AA)
 
         cv2.imshow("ASCII Cam", out)
@@ -147,6 +282,7 @@ def main():
             cv2.imwrite(name, out)
             print("Saved", name)
 
+    detector.close()
     cap.release()
     cv2.destroyAllWindows()
 
